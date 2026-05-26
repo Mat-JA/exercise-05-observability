@@ -1,14 +1,59 @@
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from src.database import Base, engine, get_db
 from src.models import Node
 from src.schemas import NodeCreate, NodeResponse, NodeUpdate
+import time
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
 
+# ── Prometheus metrics ──────────────────────────────────────────────
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["method", "endpoint", "status"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    ["method", "endpoint"],
+)
+
+ACTIVE_NODES = Gauge(
+    "active_nodes_total",
+    "Number of active nodes registered in the DB",
+)
+
+
+# ── Middleware ──────────────────────────────────────────────────────
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = time.perf_counter() - start
+
+    endpoint = request.url.path
+    method = request.method
+    status = str(response.status_code)
+
+    REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=status).inc()
+    REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(elapsed)
+
+    return response
+
+
+# ── Metrics endpoint ───────────────────────────────────────────────
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ── Health ─────────────────────────────────────────────────────────
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
@@ -17,8 +62,11 @@ def health(db: Session = Depends(get_db)):
     except Exception:
         db_status = "disconnected"
     count = db.query(Node).filter(Node.status == "active").count()
+    ACTIVE_NODES.set(count)
     return {"status": "ok", "db": db_status, "nodes_count": count}
 
+
+# ── CRUD ───────────────────────────────────────────────────────────
 @app.post("/api/nodes", response_model=NodeResponse, status_code=201)
 def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     existing = db.query(Node).filter(Node.name == node.name).first()
@@ -28,11 +76,14 @@ def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     db.add(db_node)
     db.commit()
     db.refresh(db_node)
+    ACTIVE_NODES.inc()
     return db_node
+
 
 @app.get("/api/nodes", response_model=list[NodeResponse])
 def list_nodes(db: Session = Depends(get_db)):
     return db.query(Node).all()
+
 
 @app.get("/api/nodes/{name}", response_model=NodeResponse)
 def get_node(name: str, db: Session = Depends(get_db)):
@@ -40,6 +91,7 @@ def get_node(name: str, db: Session = Depends(get_db)):
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     return node
+
 
 @app.put("/api/nodes/{name}", response_model=NodeResponse)
 def update_node(name: str, update: NodeUpdate, db: Session = Depends(get_db)):
@@ -55,6 +107,7 @@ def update_node(name: str, update: NodeUpdate, db: Session = Depends(get_db)):
     db.refresh(node)
     return node
 
+
 @app.delete("/api/nodes/{name}", status_code=204)
 def delete_node(name: str, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.name == name).first()
@@ -63,4 +116,5 @@ def delete_node(name: str, db: Session = Depends(get_db)):
     node.status = "inactive"
     node.updated_at = datetime.now(timezone.utc)
     db.commit()
+    ACTIVE_NODES.dec()
     return Response(status_code=204)
